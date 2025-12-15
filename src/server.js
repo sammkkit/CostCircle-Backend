@@ -10,11 +10,14 @@ app.use(express.json());
 
 // Routes
 import authRoutes from "./routes/auth/auth.js";
+import groupRoutes from "./routes/groups/groups.js";
+
 app.use("/auth", authRoutes);
+app.use("/groups", groupRoutes);
 
 app.get("/", (req, res) => {
   res.send("CostCircle backend running...");
 });
 
-const PORT = 3000;
+const PORT = 4000;
 app.listen(PORT, () => console.log("Server running on port", PORT));
