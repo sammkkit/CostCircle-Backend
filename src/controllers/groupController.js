@@ -167,5 +167,80 @@ export const getGroupMembers = async (req, res) => {
         res.status(500).json({ msg: "Server error" });
     }
 };
+//
+// ADD EXPENSE (EQUAL SPLIT)
+//
+export const addExpense = async (req, res) => {
+    try {
+        const { groupId } = req.params;
+        const { amount, description, paidBy } = req.body;
+        const userId = req.userId;
+
+        if (!amount || amount <= 0 || !paidBy) {
+            return res.status(400).json({ msg: "Invalid expense data" });
+        }
+
+        // 1️⃣ Check requester is group member
+        const memberCheck = await pool.query(
+            "SELECT id FROM group_members WHERE group_id=$1 AND user_id=$2",
+            [groupId, userId]
+        );
+
+        if (memberCheck.rows.length === 0) {
+            return res.status(403).json({ msg: "Not a group member" });
+        }
+
+        // 2️⃣ Check paidBy is group member
+        const paidByCheck = await pool.query(
+            "SELECT id FROM group_members WHERE group_id=$1 AND user_id=$2",
+            [groupId, paidBy]
+        );
+
+        if (paidByCheck.rows.length === 0) {
+            return res.status(400).json({ msg: "paidBy must be group member" });
+        }
+
+        // 3️⃣ Create expense
+        const expenseResult = await pool.query(
+            `
+      INSERT INTO expenses (group_id, paid_by, amount, description)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id
+      `,
+            [groupId, paidBy, amount, description || null]
+        );
+
+        const expenseId = expenseResult.rows[0].id;
+
+        // 4️⃣ Get all group members
+        const membersResult = await pool.query(
+            "SELECT user_id FROM group_members WHERE group_id=$1",
+            [groupId]
+        );
+
+        const members = membersResult.rows;
+        const splitAmount = Number(amount) / members.length;
+
+        // 5️⃣ Insert splits
+        for (const member of members) {
+            await pool.query(
+                `
+        INSERT INTO expense_splits (expense_id, user_id, amount)
+        VALUES ($1, $2, $3)
+        `,
+                [expenseId, member.user_id, splitAmount]
+            );
+        }
+
+        res.status(201).json({
+            msg: "Expense added",
+            expenseId
+        });
+
+    } catch (err) {
+        console.error("ADD EXPENSE ERROR:", err);
+        res.status(500).json({ msg: "Server error" });
+    }
+};
 
 
