@@ -1,14 +1,15 @@
+/**
+ * GET /groups/:groupId/financial-summary
+ */
+// settlementController.js
 import { pool } from "../db/db.js";
 
-/**
- * GET /groups/:groupId/settlements
- */
-export const getGroupSettlements = async (req, res) => {
+export const getGroupFinancialSummary = async (req, res) => {
     try {
         const groupId = req.params.groupId;
         const userId = req.userId;
 
-        // 1️⃣ Ensure user is member of group
+        // Ensure user is member of group
         const memberCheck = await pool.query(
             `SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2`,
             [groupId, userId]
@@ -18,28 +19,25 @@ export const getGroupSettlements = async (req, res) => {
             return res.status(403).json({ msg: "Not a group member" });
         }
 
-        // 2️⃣ Get balances (same logic you already use)
+        // Get balances
         const balanceResult = await pool.query(
             `
-      SELECT
-        u.id AS user_id,
-        u.name,
-        COALESCE(SUM(
-          CASE
-            WHEN e.paid_by = u.id THEN e.amount
-            ELSE 0
-          END
-        ), 0)
-        -
-        COALESCE(SUM(es.amount), 0) AS balance
-      FROM users u
-      JOIN group_members gm ON gm.user_id = u.id
-      LEFT JOIN expenses e ON e.group_id = gm.group_id
-      LEFT JOIN expense_splits es 
-        ON es.expense_id = e.id AND es.user_id = u.id
-      WHERE gm.group_id = $1
-      GROUP BY u.id, u.name
-      `,
+            SELECT
+                u.id AS user_id,
+                u.name,
+                COALESCE(SUM(
+                    CASE WHEN e.paid_by = u.id THEN e.amount ELSE 0 END
+                ), 0)
+                -
+                COALESCE(SUM(es.amount), 0) AS balance
+            FROM users u
+            JOIN group_members gm ON gm.user_id = u.id
+            LEFT JOIN expenses e ON e.group_id = gm.group_id
+            LEFT JOIN expense_splits es 
+                ON es.expense_id = e.id AND es.user_id = u.id
+            WHERE gm.group_id = $1
+            GROUP BY u.id, u.name
+            `,
             [groupId]
         );
 
@@ -49,53 +47,56 @@ export const getGroupSettlements = async (req, res) => {
             balance: Number(row.balance)
         }));
 
-        // 3️⃣ Run settlement algorithm
-        const settlements = computeSettlements(balances);
+        const settlements = computeGroupSettlements(balances);
 
-        res.json(settlements);
+        res.json({
+            groupId,
+            settlements
+        });
 
     } catch (err) {
-        console.error("SETTLEMENT ERROR:", err);
+        console.error("FINANCIAL SUMMARY ERROR:", err);
         res.status(500).json({ msg: "Server error" });
     }
 };
-function computeSettlements(balances) {
-    const creditors = [];
-    const debtors = [];
+
+function computeGroupSettlements(balances) {
+    const receivers = [];
+    const payers = [];
 
     for (const user of balances) {
         if (user.balance > 0.01) {
-            creditors.push({ ...user });
+            receivers.push({ ...user });
         } else if (user.balance < -0.01) {
-            debtors.push({ ...user });
+            payers.push({ ...user });
         }
     }
 
     const settlements = [];
     let i = 0, j = 0;
 
-    while (i < debtors.length && j < creditors.length) {
-        const debtor = debtors[i];
-        const creditor = creditors[j];
+    while (i < payers.length && j < receivers.length) {
+        const payer = payers[i];
+        const receiver = receivers[j];
 
         const amount = Math.min(
-            Math.abs(debtor.balance),
-            creditor.balance
+            Math.abs(payer.balance),
+            receiver.balance
         );
 
         settlements.push({
-            fromUserId: debtor.userId,
-            fromName: debtor.name,
-            toUserId: creditor.userId,
-            toName: creditor.name,
+            payerUserId: payer.userId,
+            payerName: payer.name,
+            receiverUserId: receiver.userId,
+            receiverName: receiver.name,
             amount: Number(amount.toFixed(2))
         });
 
-        debtor.balance += amount;
-        creditor.balance -= amount;
+        payer.balance += amount;
+        receiver.balance -= amount;
 
-        if (Math.abs(debtor.balance) < 0.01) i++;
-        if (creditor.balance < 0.01) j++;
+        if (Math.abs(payer.balance) < 0.01) i++;
+        if (receiver.balance < 0.01) j++;
     }
 
     return settlements;

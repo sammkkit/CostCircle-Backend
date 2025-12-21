@@ -1,5 +1,5 @@
 import { pool } from "../db/db.js";
-
+import sleep from "../utils/delay.js";
 //
 // CREATE GROUP
 //
@@ -47,30 +47,32 @@ export const createGroup = async (req, res) => {
 //
 // LIST MY GROUPS
 //
+// Update in your groups controller
 export const getMyGroups = async (req, res) => {
     try {
         const userId = req.userId;
 
-        console.log("GET GROUPS called");
-        console.log("User ID from token:", userId);
-
         const result = await pool.query(
             `
-      SELECT g.id, g.name, g.created_at, gm.user_id
-      FROM groups g
-      JOIN group_members gm ON g.id = gm.group_id
-      WHERE gm.user_id = $1
-      ORDER BY g.created_at DESC
-      `,
+            SELECT 
+                g.id, 
+                g.name, 
+                g.created_at,
+                -- Total you paid minus total you owe in this specific group
+                COALESCE((SELECT SUM(amount) FROM expenses WHERE group_id = g.id AND paid_by = $1), 0) - 
+                COALESCE((SELECT SUM(es.amount) FROM expense_splits es 
+                          JOIN expenses e ON es.expense_id = e.id 
+                          WHERE e.group_id = g.id AND es.user_id = $1), 0) AS balance
+            FROM groups g
+            JOIN group_members gm ON g.id = gm.group_id
+            WHERE gm.user_id = $1
+            ORDER BY g.created_at DESC
+            `,
             [userId]
         );
 
-        console.log("Groups query result:", result.rows);
-
         res.json(result.rows);
-
     } catch (err) {
-        console.error("GET GROUPS ERROR:", err);
         res.status(500).json({ msg: "Server error" });
     }
 };
@@ -132,6 +134,7 @@ export const addMemberToGroup = async (req, res) => {
         res.status(500).json({ msg: "Server error" });
     }
 };
+
 //
 // GET GROUP MEMBERS
 //
@@ -243,4 +246,45 @@ export const addExpense = async (req, res) => {
     }
 };
 
+
+export const getGroupsSummary = async (req, res) => {
+    try {
+        const userId = req.userId;
+
+        // This query calculates the specific net balance for the LOGGED-IN user
+        // by subtracting what they owe (splits) from what they paid (expenses).
+        const result = await pool.query(
+            `
+            SELECT 
+                g.id, 
+                g.name, 
+                COALESCE(SUM(CASE WHEN e.paid_by = $1 THEN e.amount ELSE 0 END), 0) - 
+                COALESCE(SUM(es.amount), 0) AS user_net_balance,
+                (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count
+            FROM groups g
+            JOIN group_members gm ON g.id = gm.group_id
+            LEFT JOIN expenses e ON e.group_id = g.id
+            LEFT JOIN expense_splits es ON es.expense_id = e.id AND es.user_id = $1
+            WHERE gm.user_id = $1
+            GROUP BY g.id, g.name
+            ORDER BY g.id DESC
+            `,
+            [userId]
+        );
+
+        // Ensure numbers are formatted correctly
+        const summary = result.rows.map(row => ({
+            groupId: row.id,
+            groupName: row.name,
+            netAmount: parseFloat(row.user_net_balance).toFixed(2),
+            direction: row.user_net_balance < 0 ? "YOU_OWE" : row.user_net_balance > 0 ? "YOU_ARE_OWED" : "SETTLED",
+            memberCount: parseInt(row.member_count)
+        }));
+
+        res.json(summary);
+    } catch (err) {
+        console.error("SUMMARY ERROR:", err);
+        res.status(500).json({ msg: "Server error" });
+    }
+};
 

@@ -8,9 +8,9 @@ import {
 } from "../../controllers/groupController.js";
 
 import { getGroupBalances } from "../../controllers/balanceController.js";
-import { getGroupSettlements } from "../../controllers/settlementController.js";
+import { getGroupFinancialSummary } from "../../controllers/settlementController.js";
 import { authMiddleware } from "../../middleware/authMiddleware.js";
-
+import { getGroupsSummary } from "../../controllers/groupController.js";
 const router = express.Router();
 
 /*
@@ -33,7 +33,7 @@ router.post("/:groupId/expenses", authMiddleware, addExpense);
 /*
 Group Settlement Management
 */
-router.get("/:groupId/settlements", authMiddleware, getGroupSettlements);
+router.get("/:groupId/financial-summary", authMiddleware, getGroupFinancialSummary);
 
 /*  
 Group Balance Management
@@ -42,6 +42,14 @@ router.get(
     "/:groupId/balances",
     authMiddleware,
     getGroupBalances
+);
+/*
+Group Summary
+*/
+router.get(
+    "/summary",
+    authMiddleware,
+    getGroupsSummary
 );
 
 export default router;
