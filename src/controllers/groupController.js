@@ -4,34 +4,43 @@ import sleep from "../utils/delay.js";
 // CREATE GROUP
 //
 export const createGroup = async (req, res) => {
+    // Generate a quick random ID to track this specific execution instance
+    const debugId = Math.random().toString(36).substring(7);
+    const timestamp = new Date().toISOString();
+
+    console.log(`\n--- [DEBUG_START: ${debugId}] ---`);
+    console.log(`Time: ${timestamp}`);
+    
     try {
         const { name } = req.body;
         const userId = req.userId;
 
-        console.log("CREATE GROUP called");
-        console.log("User ID from token:", userId);
-        console.log("Group name:", name);
+        console.log(`[${debugId}] User ID:`, userId);
+        console.log(`[${debugId}] Group Name:`, name);
 
         if (!name) {
+            console.log(`[${debugId}] VALIDATION FAILED: Name is missing`);
             return res.status(400).json({ msg: "Group name required" });
         }
 
-        // Create group
+        // Check if a group with this exact name and creator was JUST made (Self-Correction)
+        console.log(`[${debugId}] Executing Group INSERT...`);
         const result = await pool.query(
             "INSERT INTO groups (name, created_by) VALUES ($1, $2) RETURNING id",
             [name, userId]
         );
 
         const groupId = result.rows[0].id;
-        console.log("Created group ID:", groupId);
+        console.log(`[${debugId}] SUCCESS: Created group ID:`, groupId);
 
-        // Add creator as member
+        console.log(`[${debugId}] Executing Member INSERT for userId: ${userId}...`);
         const memberResult = await pool.query(
             "INSERT INTO group_members (group_id, user_id) VALUES ($1, $2) RETURNING *",
             [groupId, userId]
         );
 
-        console.log("Inserted into group_members:", memberResult.rows[0]);
+        console.log(`[${debugId}] SUCCESS: Inserted into group_members`);
+        console.log(`--- [DEBUG_END: ${debugId}] ---\n`);
 
         res.status(201).json({
             msg: "Group created",
@@ -39,7 +48,8 @@ export const createGroup = async (req, res) => {
         });
 
     } catch (err) {
-        console.error("CREATE GROUP ERROR:", err);
+        console.error(`[${debugId}] !!! CREATE GROUP ERROR:`, err);
+        console.log(`--- [DEBUG_END: ${debugId}] WITH ERROR ---\n`);
         res.status(500).json({ msg: "Server error" });
     }
 };
@@ -288,3 +298,110 @@ export const getGroupsSummary = async (req, res) => {
     }
 };
 
+
+//
+// BULK ADD MEMBERS TO GROUP
+//
+export const addMembersBulk = async (req, res) => {
+    try {
+        const { groupId } = req.params;
+        const { emails } = req.body; // Expecting { "emails": ["a@b.com", "c@d.com"] }
+        const requesterId = req.userId;
+
+        if (!emails || !Array.isArray(emails) || emails.length === 0) {
+            return res.status(400).json({ msg: "Valid emails array required" });
+        }
+
+        // 1. Check if requester is a group member
+        const membership = await pool.query(
+            "SELECT id FROM group_members WHERE group_id=$1 AND user_id=$2",
+            [groupId, requesterId]
+        );
+
+        if (membership.rows.length === 0) {
+            return res.status(403).json({ msg: "Not authorized to add members to this group" });
+        }
+
+        // 2. Find existing users for these emails
+        const userResults = await pool.query(
+            "SELECT id, email FROM users WHERE email = ANY($1)",
+            [emails]
+        );
+
+        const foundUserIds = userResults.rows.map(row => row.id);
+        const foundEmails = userResults.rows.map(row => row.email);
+        const missingEmails = emails.filter(e => !foundEmails.includes(e));
+
+        if (foundUserIds.length === 0) {
+            return res.status(404).json({ 
+                msg: "No users found for the provided emails", 
+                missingEmails 
+            });
+        }
+
+        // 3. Add valid users (ignoring those already in the group to prevent errors)
+        // Using "INSERT INTO ... SELECT ... ON CONFLICT DO NOTHING"
+        await pool.query(
+            `
+            INSERT INTO group_members (group_id, user_id)
+            SELECT $1, unnest($2::int[])
+            ON CONFLICT (group_id, user_id) DO NOTHING
+            `,
+            [groupId, foundUserIds]
+        );
+
+        res.json({
+            msg: `${foundUserIds.length} users processed`,
+            addedCount: foundUserIds.length,
+            missingEmails: missingEmails // Send back emails that don't have an account
+        });
+
+    } catch (err) {
+        console.error("BULK ADD ERROR:", err);
+        res.status(500).json({ msg: "Server error" });
+    }
+};
+
+//
+// GET GROUP EXPENSE HISTORY (TRANSACTIONS)
+//
+export const getGroupExpenses = async (req, res) => {
+    try {
+        const { groupId } = req.params;
+        const userId = req.userId;
+
+        // 1. Authorization Check
+        const membership = await pool.query(
+            "SELECT id FROM group_members WHERE group_id=$1 AND user_id=$2",
+            [groupId, userId]
+        );
+
+        if (membership.rows.length === 0) {
+            return res.status(403).json({ msg: "Not authorized to view this group" });
+        }
+
+        // 2. Fetch Expenses with Payer Info
+        const result = await pool.query(
+            `
+            SELECT 
+                e.id, 
+                e.description, 
+                e.amount, 
+                e.created_at,
+                u.name AS paid_by_name,
+                e.paid_by = $2 AS was_paid_by_me
+            FROM expenses e
+            JOIN users u ON e.paid_by = u.id
+            WHERE e.group_id = $1
+            ORDER BY e.created_at DESC
+            `,
+            [groupId, userId]
+        );
+
+        res.json(result.rows);
+
+    } catch (err) {
+        console.error("GET EXPENSES ERROR:", err);
+        res.status(500).json({ msg: "Server error" });
+    }
+};

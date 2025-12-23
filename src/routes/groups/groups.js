@@ -4,7 +4,9 @@ import {
     getMyGroups,
     addMemberToGroup,
     getGroupMembers,
-    addExpense
+    addExpense,
+    addMembersBulk,
+    getGroupExpenses
 } from "../../controllers/groupController.js";
 
 import { getGroupBalances } from "../../controllers/balanceController.js";
@@ -43,6 +45,12 @@ router.get(
     authMiddleware,
     getGroupBalances
 );
+/*
+Group Member Management
+*/
+router.post("/:groupId/members/bulk", authMiddleware, addMembersBulk);
+
+router.get("/:groupId/expenses", authMiddleware, getGroupExpenses);
 /*
 Group Summary
 */
