@@ -8,7 +8,7 @@ import {
     addMembersBulk,
     getGroupExpenses
 } from "../../controllers/groupController.js";
-
+import { settleUp } from "../../controllers/paymentController.js";
 import { getGroupBalances } from "../../controllers/balanceController.js";
 import { getGroupFinancialSummary } from "../../controllers/settlementController.js";
 import { authMiddleware } from "../../middleware/authMiddleware.js";
@@ -59,5 +59,8 @@ router.get(
     authMiddleware,
     getGroupsSummary
 );
+
+// POST /api/groups/:groupId/settle
+router.post('/:groupId/settle', authMiddleware, settleUp);
 
 export default router;

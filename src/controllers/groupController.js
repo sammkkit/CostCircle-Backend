@@ -257,39 +257,86 @@ export const addExpense = async (req, res) => {
 };
 
 
+// controllers/groupController.js
+
 export const getGroupsSummary = async (req, res) => {
     try {
         const userId = req.userId;
 
-        // This query calculates the specific net balance for the LOGGED-IN user
-        // by subtracting what they owe (splits) from what they paid (expenses).
         const result = await pool.query(
             `
+            WITH MyExpenses AS (
+                -- 1. Total amount I physically paid for expenses in each group
+                SELECT group_id, SUM(amount) as total_paid
+                FROM expenses
+                WHERE paid_by = $1
+                GROUP BY group_id
+            ),
+            MySplits AS (
+                -- 2. Total amount I was supposed to pay (my share) in each group
+                SELECT e.group_id, SUM(es.amount) as total_share
+                FROM expense_splits es
+                JOIN expenses e ON es.expense_id = e.id
+                WHERE es.user_id = $1
+                GROUP BY e.group_id
+            ),
+            MyPaymentsSent AS (
+                -- 3. Total Settle-Up payments I SENT to others
+                SELECT group_id, SUM(amount) as amt
+                FROM payments
+                WHERE payer_id = $1
+                GROUP BY group_id
+            ),
+            MyPaymentsReceived AS (
+                -- 4. Total Settle-Up payments I RECEIVED from others
+                SELECT group_id, SUM(amount) as amt
+                FROM payments
+                WHERE receiver_id = $1
+                GROUP BY group_id
+            )
             SELECT 
                 g.id, 
                 g.name, 
-                COALESCE(SUM(CASE WHEN e.paid_by = $1 THEN e.amount ELSE 0 END), 0) - 
-                COALESCE(SUM(es.amount), 0) AS user_net_balance,
+                -- THE MASTER FORMULA:
+                -- (What I Paid - My Share) + (Payments I Sent - Payments I Got)
+                (
+                    (COALESCE(me.total_paid, 0) - COALESCE(ms.total_share, 0)) + 
+                    (COALESCE(mps.amt, 0) - COALESCE(mpr.amt, 0))
+                ) AS final_net_balance,
                 (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count
             FROM groups g
             JOIN group_members gm ON g.id = gm.group_id
-            LEFT JOIN expenses e ON e.group_id = g.id
-            LEFT JOIN expense_splits es ON es.expense_id = e.id AND es.user_id = $1
+            LEFT JOIN MyExpenses me ON me.group_id = g.id
+            LEFT JOIN MySplits ms ON ms.group_id = g.id
+            LEFT JOIN MyPaymentsSent mps ON mps.group_id = g.id
+            LEFT JOIN MyPaymentsReceived mpr ON mpr.group_id = g.id
             WHERE gm.user_id = $1
-            GROUP BY g.id, g.name
-            ORDER BY g.id DESC
+            ORDER BY g.created_at DESC;
             `,
             [userId]
         );
 
-        // Ensure numbers are formatted correctly
-        const summary = result.rows.map(row => ({
-            groupId: row.id,
-            groupName: row.name,
-            netAmount: parseFloat(row.user_net_balance).toFixed(2),
-            direction: row.user_net_balance < 0 ? "YOU_OWE" : row.user_net_balance > 0 ? "YOU_ARE_OWED" : "SETTLED",
-            memberCount: parseInt(row.member_count)
-        }));
+        const summary = result.rows.map(row => {
+            const balance = parseFloat(row.final_net_balance);
+            
+            // Logic: 
+            // - Negative Balance: I owe money (Red)
+            // - Positive Balance: I am owed money (Green)
+            // - Near Zero: Settled
+            
+            let direction = "SETTLED";
+            if (balance < -0.01) direction = "YOU_OWE";
+            if (balance > 0.01) direction = "YOU_ARE_OWED";
+
+            return {
+                groupId: row.id,
+                groupName: row.name,
+                // SEND RAW NUMBER for ViewModel math, format on UI only
+                netAmount: Math.abs(balance), 
+                direction: direction,
+                memberCount: parseInt(row.member_count)
+            };
+        });
 
         res.json(summary);
     } catch (err) {
@@ -297,7 +344,6 @@ export const getGroupsSummary = async (req, res) => {
         res.status(500).json({ msg: "Server error" });
     }
 };
-
 
 //
 // BULK ADD MEMBERS TO GROUP
