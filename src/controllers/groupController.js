@@ -1,15 +1,11 @@
-import { pool } from "../db/db.js";
+import { pool, withTransaction } from "../db/db.js";
 import sleep from "../utils/delay.js";
 //
 // CREATE GROUP
 //
 export const createGroup = async (req, res) => {
-    // Generate a quick random ID to track this specific execution instance
     const debugId = Math.random().toString(36).substring(7);
-    const timestamp = new Date().toISOString();
-
     console.log(`\n--- [DEBUG_START: ${debugId}] ---`);
-    console.log(`Time: ${timestamp}`);
     
     try {
         const { name } = req.body;
@@ -23,23 +19,30 @@ export const createGroup = async (req, res) => {
             return res.status(400).json({ msg: "Group name required" });
         }
 
-        // Check if a group with this exact name and creator was JUST made (Self-Correction)
-        console.log(`[${debugId}] Executing Group INSERT...`);
-        const result = await pool.query(
-            "INSERT INTO groups (name, created_by) VALUES ($1, $2) RETURNING id",
-            [name, userId]
-        );
+        // 🔒 ATOMIC TRANSACTION: Both group and member are created together
+        // If member insert fails, the group is also rolled back
+        const groupId = await withTransaction(async (client) => {
+            console.log(`[${debugId}] BEGIN TRANSACTION`);
+            
+            // Create group
+            const result = await client.query(
+                "INSERT INTO groups (name, created_by) VALUES ($1, $2) RETURNING id",
+                [name, userId]
+            );
+            const newGroupId = result.rows[0].id;
+            console.log(`[${debugId}] Created group ID:`, newGroupId);
 
-        const groupId = result.rows[0].id;
-        console.log(`[${debugId}] SUCCESS: Created group ID:`, groupId);
+            // Add creator as member
+            await client.query(
+                "INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)",
+                [newGroupId, userId]
+            );
+            console.log(`[${debugId}] Added creator as member`);
+            
+            return newGroupId;
+        });
 
-        console.log(`[${debugId}] Executing Member INSERT for userId: ${userId}...`);
-        const memberResult = await pool.query(
-            "INSERT INTO group_members (group_id, user_id) VALUES ($1, $2) RETURNING *",
-            [groupId, userId]
-        );
-
-        console.log(`[${debugId}] SUCCESS: Inserted into group_members`);
+        console.log(`[${debugId}] TRANSACTION COMMITTED`);
         console.log(`--- [DEBUG_END: ${debugId}] ---\n`);
 
         res.status(201).json({
@@ -48,7 +51,7 @@ export const createGroup = async (req, res) => {
         });
 
     } catch (err) {
-        console.error(`[${debugId}] !!! CREATE GROUP ERROR:`, err);
+        console.error(`[${debugId}] !!! CREATE GROUP ERROR (ROLLED BACK):`, err);
         console.log(`--- [DEBUG_END: ${debugId}] WITH ERROR ---\n`);
         res.status(500).json({ msg: "Server error" });
     }
@@ -181,7 +184,7 @@ export const getGroupMembers = async (req, res) => {
     }
 };
 //
-// ADD EXPENSE (EQUAL SPLIT)
+// ADD EXPENSE (EQUAL SPLIT) - ATOMIC TRANSACTION
 //
 export const addExpense = async (req, res) => {
     try {
@@ -193,7 +196,7 @@ export const addExpense = async (req, res) => {
             return res.status(400).json({ msg: "Invalid expense data" });
         }
 
-        // 1️⃣ Check requester is group member
+        // 1️⃣ Check requester is group member (read-only, outside transaction)
         const memberCheck = await pool.query(
             "SELECT id FROM group_members WHERE group_id=$1 AND user_id=$2",
             [groupId, userId]
@@ -203,7 +206,7 @@ export const addExpense = async (req, res) => {
             return res.status(403).json({ msg: "Not a group member" });
         }
 
-        // 2️⃣ Check paidBy is group member
+        // 2️⃣ Check paidBy is group member (read-only, outside transaction)
         const paidByCheck = await pool.query(
             "SELECT id FROM group_members WHERE group_id=$1 AND user_id=$2",
             [groupId, paidBy]
@@ -213,37 +216,46 @@ export const addExpense = async (req, res) => {
             return res.status(400).json({ msg: "paidBy must be group member" });
         }
 
-        // 3️⃣ Create expense
-        const expenseResult = await pool.query(
-            `
-      INSERT INTO expenses (group_id, paid_by, amount, description)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id
-      `,
-            [groupId, paidBy, amount, description || null]
-        );
-
-        const expenseId = expenseResult.rows[0].id;
-
-        // 4️⃣ Get all group members
-        const membersResult = await pool.query(
-            "SELECT user_id FROM group_members WHERE group_id=$1",
-            [groupId]
-        );
-
-        const members = membersResult.rows;
-        const splitAmount = Number(amount) / members.length;
-
-        // 5️⃣ Insert splits
-        for (const member of members) {
-            await pool.query(
-                `
-        INSERT INTO expense_splits (expense_id, user_id, amount)
-        VALUES ($1, $2, $3)
-        `,
-                [expenseId, member.user_id, splitAmount]
+        // 🔒 ATOMIC TRANSACTION: Expense + all splits created together
+        // If ANY split fails, the expense is also rolled back
+        const expenseId = await withTransaction(async (client) => {
+            // 3️⃣ Create expense
+            const expenseResult = await client.query(
+                `INSERT INTO expenses (group_id, paid_by, amount, description)
+                 VALUES ($1, $2, $3, $4)
+                 RETURNING id`,
+                [groupId, paidBy, amount, description || null]
             );
-        }
+            const newExpenseId = expenseResult.rows[0].id;
+
+            // 4️⃣ Get all group members
+            const membersResult = await client.query(
+                "SELECT user_id FROM group_members WHERE group_id=$1",
+                [groupId]
+            );
+
+            const members = membersResult.rows;
+            const splitAmount = Number(amount) / members.length;
+
+            // 5️⃣ Insert all splits (using batch insert for efficiency)
+            const splitValues = members.map((_, i) => 
+                `($1, $${i + 2}, $${members.length + 2})`
+            ).join(', ');
+            
+            const splitParams = [
+                newExpenseId,
+                ...members.map(m => m.user_id),
+                splitAmount
+            ];
+
+            await client.query(
+                `INSERT INTO expense_splits (expense_id, user_id, amount)
+                 VALUES ${members.map((_, i) => `($1, $${i + 2}, $${members.length + 2})`).join(', ')}`,
+                splitParams
+            );
+
+            return newExpenseId;
+        });
 
         res.status(201).json({
             msg: "Expense added",
@@ -251,7 +263,7 @@ export const addExpense = async (req, res) => {
         });
 
     } catch (err) {
-        console.error("ADD EXPENSE ERROR:", err);
+        console.error("ADD EXPENSE ERROR (ROLLED BACK):", err);
         res.status(500).json({ msg: "Server error" });
     }
 };
