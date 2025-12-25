@@ -515,43 +515,49 @@ export const addMembersBulk = async (req, res) => {
 //
 // GET GROUP EXPENSE HISTORY (TRANSACTIONS)
 //
+//
+// GET GROUP TRANSACTIONS (EXPENSES + SETTLEMENTS)
+//
+//
+// GET GROUP TRANSACTIONS (EXPENSES + PAYMENTS)
+//
 export const getGroupExpenses = async (req, res) => {
     try {
         const { groupId } = req.params;
-        const userId = req.userId;
 
-        // 1. Authorization Check
-        const membership = await pool.query(
-            "SELECT id FROM group_members WHERE group_id=$1 AND user_id=$2",
-            [groupId, userId]
-        );
-
-        if (membership.rows.length === 0) {
-            return res.status(403).json({ msg: "Not authorized to view this group" });
-        }
-
-        // 2. Fetch Expenses with Payer Info
-        const result = await pool.query(
-            `
+        const query = `
             SELECT 
-                e.id, 
-                e.description, 
-                e.amount, 
-                e.created_at,
-                u.name AS paid_by_name,
-                e.paid_by = $2 AS was_paid_by_me
-            FROM expenses e
-            JOIN users u ON e.paid_by = u.id
-            WHERE e.group_id = $1
-            ORDER BY e.created_at DESC
-            `,
-            [groupId, userId]
-        );
+                id, 
+                description, 
+                amount, 
+                paid_by as "payerId", 
+                NULL as "receiverId", 
+                created_at as "createdAt",
+                'EXPENSE' as type
+            FROM expenses 
+            WHERE group_id = $1
 
+            UNION ALL
+
+            SELECT 
+                id, 
+                'Payment' as description, 
+                amount, 
+                payer_id as "payerId",    -- Make sure your payments table uses 'payer_id'
+                receiver_id as "receiverId", -- and 'receiver_id'
+                created_at as "createdAt", 
+                'SETTLEMENT' as type
+            FROM payments  -- <--- CHANGED FROM 'settlements' TO 'payments'
+            WHERE group_id = $1
+
+            ORDER BY "createdAt" DESC;
+        `;
+
+        const result = await pool.query(query, [groupId]);
         res.json(result.rows);
 
     } catch (err) {
-        console.error("GET EXPENSES ERROR:", err);
-        res.status(500).json({ msg: "Server error" });
+        console.error(err.message);
+        res.status(500).send("Server Error");
     }
 };
