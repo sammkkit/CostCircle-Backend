@@ -1,95 +1,77 @@
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import { pool } from "../db/db.js";
+import { OAuth2Client } from 'google-auth-library';
+import jwt from 'jsonwebtoken';
+import { pool } from '../db/db.js';
 
-//
-// REGISTER
-//
-export const register = async (req, res) => {
+// Initialize the Google Client with your Client ID from the Cloud Console
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+export const googleLogin = async (req, res) => {
     try {
-        const { name, email, password } = req.body;
+        const { idToken } = req.body;
 
-        // Validation
-        if (!name || !email || !password) {
-            return res.status(400).json({ msg: "All fields are required" });
+        if (!idToken) {
+            return res.status(400).json({ msg: "ID Token is required" });
         }
 
-        // Check if email exists
-        const existing = await pool.query(
-            "SELECT id FROM users WHERE email = $1",
-            [email]
-        );
+        // 1. Verify the token with Google
+        // This ensures the token was actually issued by Google for YOUR app
+        const ticket = await client.verifyIdToken({
+            idToken,
+            audience: process.env.GOOGLE_CLIENT_ID,
+        });
+        
+        const payload = ticket.getPayload();
+        // Extract user info from the secure payload
+        const { email, name, sub: googleId, picture } = payload;
 
-        if (existing.rows.length > 0) {
-            return res.status(400).json({ msg: "Email already registered" });
+        // 2. Check if user exists in YOUR database
+        const userCheck = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+
+        let userId;
+        let userName = name;
+        let userPicture = picture;
+
+        if (userCheck.rows.length > 0) {
+            // CASE A: User exists -> Log them in
+            const user = userCheck.rows[0];
+            userId = user.id;
+
+            // Optional: Update their picture/google_id if they linked an old account
+            if (!user.google_id || user.picture !== picture) {
+                await pool.query(
+                    "UPDATE users SET google_id=$1, picture=$2 WHERE id=$3", 
+                    [googleId, picture, userId]
+                );
+            }
+        } else {
+            // CASE B: New User -> Create account automatically
+            // Password is NOT required anymore (nullable in DB)
+            const newUser = await pool.query(
+                "INSERT INTO users (name, email, google_id, picture) VALUES ($1, $2, $3, $4) RETURNING id",
+                [name, email, googleId, picture]
+            );
+            userId = newUser.rows[0].id;
         }
 
-        // Hash password
-        const hashed = await bcrypt.hash(password, 10);
+        // 3. Generate YOUR App's JWT (Session Token)
+        // This is the token Android will use for all future requests (addExpense, etc.)
+        const token = jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+            expiresIn: "30d",
+        });
 
-        // Insert new user
-        await pool.query(
-            "INSERT INTO users (name, email, password) VALUES ($1, $2, $3)",
-            [name, email, hashed]
-        );
-
-        res.status(201).json({ msg: "User registered successfully" });
-
-    } catch (error) {
-        console.error("REGISTER ERROR:", error);
-        res.status(500).json({ msg: "Server error" });
-    }
-};
-
-//
-// LOGIN
-//
-export const login = async (req, res) => {
-    try {
-        const { email, password } = req.body;
-
-        // Validation
-        if (!email || !password) {
-            return res.status(400).json({ msg: "Email and password required" });
-        }
-
-        // Check if user exists
-        const result = await pool.query(
-            "SELECT * FROM users WHERE email = $1",
-            [email]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(400).json({ msg: "Invalid credentials" });
-        }
-
-        const user = result.rows[0];
-
-        // Compare password
-        const isMatch = await bcrypt.compare(password, user.password);
-        if (!isMatch) {
-            return res.status(400).json({ msg: "Invalid credentials" });
-        }
-
-        // Create JWT token
-        const token = jwt.sign(
-            { id: user.id },
-            process.env.JWT_SECRET,
-            { expiresIn: "7d" }
-        );
-
-        res.json({
-            msg: "Login successful",
-            token,
+        // 4. Send back the data needed for the Android UI
+        res.status(200).json({ 
+            token, 
             user: {
-                id: user.id,
-                name: user.name,
-                email: user.email
+                id: userId,
+                name: userName,
+                email: email,
+                picture: userPicture
             }
         });
 
-    } catch (error) {
-        console.error("LOGIN ERROR:", error);
-        res.status(500).json({ msg: "Server error" });
+    } catch (err) {
+        console.error("GOOGLE LOGIN ERROR:", err);
+        res.status(401).json({ msg: "Invalid or expired Google Token" });
     }
 };
