@@ -184,90 +184,182 @@ export const getGroupMembers = async (req, res) => {
     }
 };
 //
-// ADD EXPENSE (EQUAL SPLIT) - ATOMIC TRANSACTION
+// ADD EXPENSE (HANDLES EQUAL, EXACT, & PERCENTAGE)
 //
 export const addExpense = async (req, res) => {
+    // Start a client for the transaction
+    const client = await pool.connect();
+    
     try {
         const { groupId } = req.params;
-        const { amount, description, paidBy } = req.body;
-        const userId = req.userId;
+        const { description, amount, paidBy, splitType = 'EQUAL', splits } = req.body;
+        // splits structure example: [{ userId: 1, value: 50 }, { userId: 2, value: 25 }] 
+        
+        const requesterId = req.userId;
+        const totalAmount = Number(amount);
 
-        if (!amount || amount <= 0 || !paidBy) {
-            return res.status(400).json({ msg: "Invalid expense data" });
+        if (!totalAmount || totalAmount <= 0) {
+            return res.status(400).json({ msg: "Invalid amount" });
         }
 
-        // 1️⃣ Check requester is group member (read-only, outside transaction)
-        const memberCheck = await pool.query(
-            "SELECT id FROM group_members WHERE group_id=$1 AND user_id=$2",
-            [groupId, userId]
+        // 1. Authorization: Requester must be in the group
+        const membershipCheck = await client.query(
+            "SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2",
+            [groupId, requesterId]
         );
-
-        if (memberCheck.rows.length === 0) {
-            return res.status(403).json({ msg: "Not a group member" });
+        if (membershipCheck.rowCount === 0) {
+            return res.status(403).json({ msg: "You are not a member of this group" });
         }
 
-        // 2️⃣ Check paidBy is group member (read-only, outside transaction)
-        const paidByCheck = await pool.query(
-            "SELECT id FROM group_members WHERE group_id=$1 AND user_id=$2",
-            [groupId, paidBy]
+        // 2. Validation: Payer must be in the group
+        // If paidBy is not provided, assume the requester paid
+        const actualPayerId = paidBy || requesterId;
+        const payerCheck = await client.query(
+            "SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2",
+            [groupId, actualPayerId]
         );
-
-        if (paidByCheck.rows.length === 0) {
-            return res.status(400).json({ msg: "paidBy must be group member" });
+        if (payerCheck.rowCount === 0) {
+            return res.status(400).json({ msg: "Payer must be a group member" });
         }
 
-        // 🔒 ATOMIC TRANSACTION: Expense + all splits created together
-        // If ANY split fails, the expense is also rolled back
-        const expenseId = await withTransaction(async (client) => {
-            // 3️⃣ Create expense
-            const expenseResult = await client.query(
-                `INSERT INTO expenses (group_id, paid_by, amount, description)
-                 VALUES ($1, $2, $3, $4)
-                 RETURNING id`,
-                [groupId, paidBy, amount, description || null]
+        // --- NEW VALIDATION: Ensure all split users are in the group ---
+        if (splits && splits.length > 0) {
+            const splitUserIds = splits.map(s => s.userId);
+            
+            // Query DB to find which of these IDs are valid members
+            // usage of ANY($2::int[]) allows us to check an array of IDs in one query
+            const validMembersRes = await client.query(
+                "SELECT user_id FROM group_members WHERE group_id = $1 AND user_id = ANY($2::int[])",
+                [groupId, splitUserIds]
             );
-            const newExpenseId = expenseResult.rows[0].id;
 
-            // 4️⃣ Get all group members
-            const membersResult = await client.query(
-                "SELECT user_id FROM group_members WHERE group_id=$1",
+            const validMemberIds = validMembersRes.rows.map(r => r.user_id);
+            
+            // Find invalid IDs (IDs requested but not found in the group)
+            const invalidIds = splitUserIds.filter(id => !validMemberIds.includes(id));
+
+            if (invalidIds.length > 0) {
+                return res.status(400).json({ 
+                    msg: `Users [${invalidIds.join(', ')}] are not members of this group` 
+                });
+            }
+        }
+        // --- END NEW VALIDATION ---
+
+        // 3. Logic: Calculate Shares based on Split Type
+        let finalSplits = []; 
+
+        // Default: If no 'splits' array sent, assume EQUAL split among ALL members
+        let targetUsers = splits;
+        if (!targetUsers || targetUsers.length === 0) {
+             const allMembers = await client.query(
+                "SELECT user_id FROM group_members WHERE group_id = $1",
                 [groupId]
             );
+            targetUsers = allMembers.rows.map(m => ({ userId: m.user_id }));
+        }
 
-            const members = membersResult.rows;
-            const splitAmount = Number(amount) / members.length;
+        if (splitType === 'EQUAL') {
+            // Distribute amount equally, handling pennies
+            const count = targetUsers.length;
+            const baseShare = Math.floor((totalAmount / count) * 100) / 100; // Round down to 2 decimals
+            let remainder = Math.round((totalAmount - (baseShare * count)) * 100); 
 
-            // 5️⃣ Insert all splits (using batch insert for efficiency)
-            const splitValues = members.map((_, i) => 
-                `($1, $${i + 2}, $${members.length + 2})`
-            ).join(', ');
-            
-            const splitParams = [
-                newExpenseId,
-                ...members.map(m => m.user_id),
-                splitAmount
-            ];
+            finalSplits = targetUsers.map(u => {
+                let share = baseShare;
+                if (remainder > 0) {
+                    share += 0.01; 
+                    remainder--;
+                }
+                return { userId: u.userId, amount: Number(share.toFixed(2)) };
+            });
 
-            await client.query(
-                `INSERT INTO expense_splits (expense_id, user_id, amount)
-                 VALUES ${members.map((_, i) => `($1, $${i + 2}, $${members.length + 2})`).join(', ')}`,
-                splitParams
-            );
+        } else if (splitType === 'EXACT') {
+            // Validation: Sum must match Total
+            let sum = 0;
+            finalSplits = targetUsers.map(s => {
+                const val = Number(s.value || 0);
+                sum += val;
+                return { userId: s.userId, amount: val };
+            });
 
-            return newExpenseId;
+            if (Math.abs(totalAmount - sum) > 0.01) {
+                return res.status(400).json({ msg: `Sum (${sum}) does not match Total (${totalAmount})` });
+            }
+
+        } else if (splitType === 'PERCENTAGE') {
+            // Logic: (Total * Percent) / 100
+            let sumPercent = 0;
+            let currentSumAmount = 0;
+
+            finalSplits = targetUsers.map((s) => {
+                const val = Number(s.value || 0);
+                sumPercent += val;
+                
+                let rawShare = (totalAmount * val) / 100;
+                let roundedShare = Math.round(rawShare * 100) / 100; 
+
+                currentSumAmount += roundedShare;
+                return { userId: s.userId, amount: roundedShare };
+            });
+
+            if (Math.abs(100 - sumPercent) > 0.1) {
+                return res.status(400).json({ msg: `Percentages sum to ${sumPercent}%, expected 100%` });
+            }
+
+            // Fix Penny Rounding on the first person
+            let diff = totalAmount - currentSumAmount;
+            if (Math.abs(diff) > 0.001) {
+                finalSplits[0].amount += diff;
+                finalSplits[0].amount = Number(finalSplits[0].amount.toFixed(2));
+            }
+        }
+
+        // 4. DATABASE TRANSACTION
+        await client.query('BEGIN');
+
+        // A. Insert Expense
+        const expenseRes = await client.query(
+            `INSERT INTO expenses (description, amount, paid_by, group_id, split_type) 
+             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+            [description, totalAmount, actualPayerId, groupId, splitType]
+        );
+        const expenseId = expenseRes.rows[0].id;
+
+        // B. Insert Splits
+        const splitQueryValues = [];
+        const splitParams = [];
+        let paramIndex = 1;
+
+        finalSplits.forEach(split => {
+            splitQueryValues.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2})`);
+            splitParams.push(expenseId, split.userId, split.amount);
+            paramIndex += 3;
         });
 
-        res.status(201).json({
-            msg: "Expense added",
-            expenseId
+        const splitQuery = `
+            INSERT INTO expense_splits (expense_id, user_id, amount)
+            VALUES ${splitQueryValues.join(", ")}
+        `;
+
+        await client.query(splitQuery, splitParams);
+
+        await client.query('COMMIT');
+
+        res.status(201).json({ 
+            msg: "Expense added successfully", 
+            expenseId,
+            splits: finalSplits 
         });
 
     } catch (err) {
-        console.error("ADD EXPENSE ERROR (ROLLED BACK):", err);
-        res.status(500).json({ msg: "Server error" });
+        await client.query('ROLLBACK');
+        console.error("ADD EXPENSE ERROR:", err);
+        res.status(500).json({ msg: "Server Error" });
+    } finally {
+        client.release();
     }
 };
-
 
 // controllers/groupController.js
 
