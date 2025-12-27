@@ -1,5 +1,6 @@
 import { pool, withTransaction } from "../db/db.js";
 import sleep from "../utils/delay.js";
+import { sendNotification } from "../controllers/notificationController.js";
 //
 // CREATE GROUP
 //
@@ -139,7 +140,32 @@ export const addMemberToGroup = async (req, res) => {
             "INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)",
             [groupId, newUserId]
         );
+        (async () => {
+            try {
+                // 1. Get Group Name & Admin Name for the message
+                const groupRes = await pool.query("SELECT name FROM groups WHERE id = $1", [groupId]);
+                const adminRes = await pool.query("SELECT name FROM users WHERE id = $1", [req.userId]);
+                
+                const groupName = groupRes.rows[0]?.name || "a group";
+                const adminName = adminRes.rows[0]?.name || "Admin";
 
+                // 2. We have the list of 'idsToAdd' (the users we just inserted)
+                // Note: Make sure 'idsToAdd' is available from your logic above
+                for (const newMemberId of idsToAdd) {
+                    await sendNotification(
+                        newMemberId,
+                        "New Group Added! 🎉",
+                        `${adminName} added you to '${groupName}'`,
+                        { 
+                            type: "GROUP_INVITE", 
+                            groupId: groupId.toString() 
+                        }
+                    );
+                }
+            } catch (notifyErr) {
+                console.error("NOTIFICATION ERROR (Ignored):", notifyErr);
+            }
+        })();
         res.json({ msg: "Member added to group" });
 
     } catch (err) {
@@ -345,7 +371,39 @@ export const addExpense = async (req, res) => {
         await client.query(splitQuery, splitParams);
 
         await client.query('COMMIT');
+        // 🔔 NEW: Send Notifications (Fire and Forget)
+        // We don't await this because we don't want to slow down the response 
+        // if notifications take time.
+        (async () => {
+            try {
+                // 1. Get all group members EXCEPT the person who added the expense
+                const membersRes = await pool.query(
+                    "SELECT user_id FROM group_members WHERE group_id = $1 AND user_id != $2",
+                    [groupId, requesterId]
+                );
+                
+                // 2. Get the name of the person who added it (for the message body)
+                const userRes = await pool.query("SELECT name FROM users WHERE id = $1", [requesterId]);
+                const payerName = userRes.rows[0]?.name || "Someone";
 
+                // 3. Loop and send
+                const memberIds = membersRes.rows.map(row => row.user_id);
+                
+                for (const memberId of memberIds) {
+                    await sendNotification(
+                        memberId,
+                        "New Expense Added 💸", 
+                        `${payerName} added '${description}' for ₹${totalAmount}`,
+                        { 
+                            type: "EXPENSE_ADDED", 
+                            groupId: groupId.toString() 
+                        }
+                    );
+                }
+            } catch (notifyErr) {
+                console.error("NOTIFICATION ERROR (Ignored):", notifyErr);
+            }
+        })();
         res.status(201).json({ 
             msg: "Expense added successfully", 
             expenseId,
@@ -499,7 +557,35 @@ export const addMembersBulk = async (req, res) => {
             `,
             [groupId, foundUserIds]
         );
+        // 🔔 NEW: Send Notifications (Logic Added Here)
+        (async () => {
+            try {
+                // Get Group Name & Requester Name
+                const groupRes = await pool.query("SELECT name FROM groups WHERE id = $1", [groupId]);
+                const requesterRes = await pool.query("SELECT name FROM users WHERE id = $1", [requesterId]);
+                
+                const groupName = groupRes.rows[0]?.name || "a group";
+                const requesterName = requesterRes.rows[0]?.name || "Someone";
 
+                // Notify all found users
+                for (const memberId of foundUserIds) {
+                    // Don't notify yourself if you somehow added your own email
+                    if (memberId === requesterId) continue;
+
+                    await sendNotification(
+                        memberId,
+                        "New Group Added! 🎉",
+                        `${requesterName} added you to '${groupName}'`,
+                        { 
+                            type: "GROUP_INVITE", 
+                            groupId: groupId.toString() 
+                        }
+                    );
+                }
+            } catch (notifyErr) {
+                console.error("NOTIFICATION ERROR (Ignored):", notifyErr);
+            }
+        })();
         res.json({
             msg: `${foundUserIds.length} users processed`,
             addedCount: foundUserIds.length,
