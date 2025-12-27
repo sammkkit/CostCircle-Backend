@@ -561,3 +561,63 @@ export const getGroupExpenses = async (req, res) => {
         res.status(500).send("Server Error");
     }
 };
+
+
+// DELETE GROUP (Admin Only)
+export const deleteGroup = async (req, res) => {
+    const debugId = Math.random().toString(36).substring(7);
+    console.log(`\n--- [DEBUG_START: ${debugId}] DELETE GROUP ---`);
+
+    try {
+        const { groupId } = req.params;
+        const userId = req.userId;
+
+        // 1. Check if Group Exists & Verify Admin
+        const groupCheck = await pool.query(
+            "SELECT created_by FROM groups WHERE id = $1", 
+            [groupId]
+        );
+        
+        if (groupCheck.rows.length === 0) {
+            return res.status(404).json({ msg: "Group not found" });
+        }
+        
+        // STRICT RULE: Only the Creator (Admin) can delete
+        if (groupCheck.rows[0].created_by !== userId) {
+            return res.status(403).json({ msg: "Only the group admin can delete this group" });
+        }
+
+        // 2. ATOMIC DELETION (The Clean Sweep)
+        await withTransaction(async (client) => {
+            console.log(`[${debugId}] Deleting dependent data...`);
+
+            // A. Delete Expense Splits (Children of Expenses)
+            // We find all expenses in this group, then delete their splits
+            await client.query(`
+                DELETE FROM expense_splits 
+                WHERE expense_id IN (SELECT id FROM expenses WHERE group_id = $1)
+            `, [groupId]);
+
+            // B. Delete Expenses (Children of Group)
+            await client.query("DELETE FROM expenses WHERE group_id = $1", [groupId]);
+
+            // C. Delete Payments/Settlements (Children of Group)
+            // *IMPORTANT* You mentioned 'settles'. Assuming table is 'payments' based on previous code.
+            await client.query("DELETE FROM payments WHERE group_id = $1", [groupId]);
+
+            // D. Delete Members (Children of Group)
+            await client.query("DELETE FROM group_members WHERE group_id = $1", [groupId]);
+
+            // E. Finally... Delete the Group
+            await client.query("DELETE FROM groups WHERE id = $1", [groupId]);
+            
+            console.log(`[${debugId}] Group ${groupId} deleted completely.`);
+        });
+
+        res.json({ msg: "Group and all related data deleted successfully" });
+
+    } catch (err) {
+        console.error(`[${debugId}] DELETE ERROR:`, err);
+        res.status(500).json({ msg: "Server error during deletion" });
+    }
+};

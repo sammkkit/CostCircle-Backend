@@ -13,6 +13,7 @@ import { getGroupBalances } from "../../controllers/balanceController.js";
 import { getGroupFinancialSummary } from "../../controllers/settlementController.js";
 import { authMiddleware } from "../../middleware/authMiddleware.js";
 import { getGroupsSummary } from "../../controllers/groupController.js";
+import { deleteGroup } from "../../controllers/groupController.js";
 const router = express.Router();
 
 /*
@@ -62,5 +63,6 @@ router.get(
 
 // POST /api/groups/:groupId/settle
 router.post('/:groupId/settle', authMiddleware, settleUp);
+router.delete("/:groupId", authMiddleware, deleteGroup);
 
 export default router;
