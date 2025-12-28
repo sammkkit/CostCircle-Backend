@@ -218,7 +218,7 @@ export const addExpense = async (req, res) => {
     
     try {
         const { groupId } = req.params;
-        const { description, amount, paidBy, splitType = 'EQUAL', splits } = req.body;
+        const { description, amount, paidBy, splitType = 'EQUAL', splits,category = 'GENERAL' } = req.body;
         // splits structure example: [{ userId: 1, value: 50 }, { userId: 2, value: 25 }] 
         
         const requesterId = req.userId;
@@ -345,10 +345,10 @@ export const addExpense = async (req, res) => {
         await client.query('BEGIN');
 
         // A. Insert Expense
-        const expenseRes = await client.query(
-            `INSERT INTO expenses (description, amount, paid_by, group_id, split_type) 
-             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-            [description, totalAmount, actualPayerId, groupId, splitType]
+       const expenseRes = await client.query(
+            `INSERT INTO expenses (description, amount, paid_by, group_id, split_type, category) 
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [description, totalAmount, actualPayerId, groupId, splitType, category] // <--- Added category here
         );
         const expenseId = expenseRes.rows[0].id;
 
@@ -619,7 +619,8 @@ export const getGroupExpenses = async (req, res) => {
                 paid_by as "payerId", 
                 NULL as "receiverId", 
                 created_at as "createdAt",
-                'EXPENSE' as type
+                'EXPENSE' as type,
+                category
             FROM expenses 
             WHERE group_id = $1
 
@@ -632,7 +633,8 @@ export const getGroupExpenses = async (req, res) => {
                 payer_id as "payerId",    -- Make sure your payments table uses 'payer_id'
                 receiver_id as "receiverId", -- and 'receiver_id'
                 created_at as "createdAt", 
-                'SETTLEMENT' as type
+                'SETTLEMENT' as type,
+                'PAYMENT' as category
             FROM payments  -- <--- CHANGED FROM 'settlements' TO 'payments'
             WHERE group_id = $1
 
