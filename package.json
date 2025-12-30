@@ -23,7 +23,8 @@
     "firebase-admin": "^13.6.0",
     "google-auth-library": "^10.5.0",
     "jsonwebtoken": "^9.0.3",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "razorpay": "^2.9.6"
   },
   "devDependencies": {
     "@jest/globals": "^30.2.0",

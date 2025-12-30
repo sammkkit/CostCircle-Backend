@@ -12,9 +12,12 @@ app.use(express.json());
 import authRoutes from "./routes/auth/auth.js";
 import groupRoutes from "./routes/groups/groups.js";
 import userRoutes from "./routes/auth/user.js";
+import subscriptionRoutes from "./routes/subscription/subscription.js";
+
 app.use("/auth", authRoutes);
 app.use("/groups", groupRoutes);
 app.use("/user", userRoutes);
+app.use("/subscription", subscriptionRoutes);
 
 app.get("/", (req, res) => {
   res.send("CostCircle backend running...");
