@@ -709,3 +709,54 @@ export const deleteGroup = async (req, res) => {
         res.status(500).json({ msg: "Server error during deletion" });
     }
 };
+
+
+
+export const getGroupStats = async (req, res) => {
+    try {
+        const { groupId } = req.params;
+
+        // 1. Total Group Spending
+        const totalQuery = await pool.query(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE group_id = $1`,
+            [groupId]
+        );
+
+        // 2. Spending by Category (For Donut Chart) 🍩
+        const categoryQuery = await pool.query(
+            `SELECT category, SUM(amount) as total 
+             FROM expenses 
+             WHERE group_id = $1 
+             GROUP BY category`,
+            [groupId]
+        );
+
+        // 3. Spending by Member (For Bar Chart) 📊
+        // We join with 'users' to get the real name
+        const memberQuery = await pool.query(
+            `SELECT u.name, SUM(e.amount) as total 
+             FROM expenses e
+             JOIN users u ON e.paid_by = u.id
+             WHERE e.group_id = $1
+             GROUP BY u.name, u.id
+             ORDER BY total DESC`,
+            [groupId]
+        );
+
+        res.json({
+            totalSpending: Number(totalQuery.rows[0].total),
+            byCategory: categoryQuery.rows.map(row => ({
+                category: row.category,
+                total: Number(row.total)
+            })),
+            byMember: memberQuery.rows.map(row => ({
+                name: row.name,
+                total: Number(row.total)
+            }))
+        });
+
+    } catch (err) {
+        console.error("STATS ERROR:", err);
+        res.status(500).json({ msg: "Server error" });
+    }
+};
