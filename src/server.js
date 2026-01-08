@@ -6,7 +6,14 @@ dotenv.config();
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+
+// Custom middleware to capture raw body for webhook signature verification
+app.use(express.json({
+  verify: (req, res, buf) => {
+    // Store raw body for routes that need it (webhooks)
+    req.rawBody = buf.toString();
+  }
+}));
 
 // Routes
 import authRoutes from "./routes/auth/auth.js";

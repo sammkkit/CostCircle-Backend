@@ -20,6 +20,6 @@ CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status);
 
 -- 3. Add is_premium column to users table (for quick premium status check)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE;
-
+ALTER TABLE subscriptions ADD COLUMN cancelled_at TIMESTAMP;
 -- 4. Verify the tables
 SELECT 'subscriptions table created successfully' AS status;

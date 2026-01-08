@@ -19,7 +19,7 @@ export const createSubscription = async (req, res) => {
 
         // 1. Check if user already has an active subscription
         const existingSubscription = await pool.query(
-            `SELECT * FROM subscriptions WHERE user_id = $1 AND status IN ('created', 'active')`,
+            `SELECT * FROM subscriptions WHERE user_id = $1 AND status IN ('created', 'active', 'authenticated')`,
             [userId]
         );
 
@@ -116,8 +116,8 @@ export const getSubscriptionStatus = async (req, res) => {
 
         const subscription = result.rows[0];
 
-        // 2. Fetch from Razorpay if status is 'created' OR period dates are missing
-        const needsRefresh = subscription.status === 'created' || 
+        // 2. Fetch from Razorpay if status might have changed
+        const needsRefresh = ['created', 'authenticated', 'pending'].includes(subscription.status) || 
                              !subscription.current_period_start || 
                              !subscription.current_period_end;
 
@@ -165,9 +165,17 @@ export const getSubscriptionStatus = async (req, res) => {
             }
         }
 
+        // Determine if user should have premium access
+        // User is premium if subscription is active OR if cancelled but still within period
+       const isPremiumActive = 
+            ['active', 'pending_cancellation'].includes(subscription.status) || 
+            (subscription.status === 'cancelled' && 
+             subscription.current_period_end && 
+             new Date(subscription.current_period_end) > new Date());
+             
         res.json({
             hasSubscription: true,
-            isPremium: subscription.status === 'active',
+            isPremium: isPremiumActive,
             subscription: {
                 id: subscription.razorpay_subscription_id,
                 status: subscription.status,
@@ -191,9 +199,9 @@ export const cancelSubscription = async (req, res) => {
     try {
         const userId = req.userId;
 
-        // 1. Find active subscription
+        // 1. Find active subscription (active or authenticated)
         const result = await pool.query(
-            `SELECT * FROM subscriptions WHERE user_id = $1 AND status = 'active'`,
+            `SELECT * FROM subscriptions WHERE user_id = $1 AND status IN ('active', 'authenticated')`,
             [userId]
         );
 
@@ -204,23 +212,35 @@ export const cancelSubscription = async (req, res) => {
         const subscription = result.rows[0];
 
         // 2. Cancel in Razorpay (at end of current period)
-        await razorpay.subscriptions.cancel(subscription.razorpay_subscription_id, {
-            cancel_at_cycle_end: 1
+        const cancelledSub = await razorpay.subscriptions.cancel(subscription.razorpay_subscription_id, {
+            cancel_at_cycle_end: 1 // User keeps access until period ends
         });
 
-        // 3. Update local database
+        // 3. Update local database - mark as 'pending_cancellation' to track graceful cancellation
+        // The actual 'cancelled' status will be set by webhook when period ends
         await pool.query(
-            `UPDATE subscriptions SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            `UPDATE subscriptions 
+             SET status = 'pending_cancellation', 
+                 cancelled_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP 
+             WHERE id = $1`,
             [subscription.id]
         );
 
         res.json({ 
-            msg: "Subscription cancelled. Access continues until current period ends.",
+            msg: "Subscription will be cancelled at the end of your billing period",
+            currentPeriodEnd: subscription.current_period_end,
             cancelledAt: new Date().toISOString()
         });
 
     } catch (err) {
         console.error("CANCEL SUBSCRIPTION ERROR:", err);
+        
+        // Handle specific Razorpay errors
+        if (err.error?.description) {
+            return res.status(400).json({ msg: err.error.description });
+        }
+        
         res.status(500).json({ msg: "Failed to cancel subscription" });
     }
 };
@@ -228,15 +248,18 @@ export const cancelSubscription = async (req, res) => {
 /**
  * RAZORPAY WEBHOOK HANDLER
  * Processes webhook events from Razorpay
+ * IMPORTANT: This route must receive raw body for signature verification
  */
 export const handleWebhook = async (req, res) => {
     try {
-        // 1. Verify webhook signature
         const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
         
+        // 1. Verify webhook signature using raw body
         if (webhookSecret) {
             const signature = req.headers['x-razorpay-signature'];
-            const body = JSON.stringify(req.body);
+            
+            // req.rawBody should be set by middleware (see server.js setup)
+            const body = req.rawBody || JSON.stringify(req.body);
             
             const expectedSignature = crypto
                 .createHmac('sha256', webhookSecret)
@@ -249,67 +272,177 @@ export const handleWebhook = async (req, res) => {
             }
         }
 
-        // 2. Process the event
+        // 2. Parse the event
         const event = req.body.event;
         const payload = req.body.payload?.subscription?.entity;
+        const paymentPayload = req.body.payload?.payment?.entity;
 
-        if (!payload) {
-            return res.status(400).json({ msg: "Invalid webhook payload" });
+        console.log(`[WEBHOOK] Event: ${event}`);
+
+        // Handle subscription events
+        if (payload) {
+            const subscriptionId = payload.id;
+            const userId = payload.notes?.user_id;
+
+            console.log(`[WEBHOOK] Subscription: ${subscriptionId}, User: ${userId}`);
+
+            switch (event) {
+                case 'subscription.authenticated':
+                    // User completed authentication, waiting for first charge
+                    await pool.query(
+                        `UPDATE subscriptions 
+                         SET status = 'authenticated', updated_at = CURRENT_TIMESTAMP
+                         WHERE razorpay_subscription_id = $1`,
+                        [subscriptionId]
+                    );
+                    break;
+
+                case 'subscription.activated':
+                    // First payment successful, subscription is now active
+                    await pool.query(
+                        `UPDATE subscriptions 
+                         SET status = 'active', 
+                             current_period_start = to_timestamp($1),
+                             current_period_end = to_timestamp($2),
+                             updated_at = CURRENT_TIMESTAMP
+                         WHERE razorpay_subscription_id = $3`,
+                        [payload.current_start, payload.current_end, subscriptionId]
+                    );
+
+                    if (userId) {
+                        await pool.query(
+                            `UPDATE users SET is_premium = TRUE WHERE id = $1`,
+                            [parseInt(userId)]
+                        );
+                    }
+                    break;
+
+                case 'subscription.charged':
+                    // Recurring payment successful
+                    await pool.query(
+                        `UPDATE subscriptions 
+                         SET status = 'active', 
+                             current_period_start = to_timestamp($1),
+                             current_period_end = to_timestamp($2),
+                             updated_at = CURRENT_TIMESTAMP
+                         WHERE razorpay_subscription_id = $3`,
+                        [payload.current_start, payload.current_end, subscriptionId]
+                    );
+
+                    if (userId) {
+                        await pool.query(
+                            `UPDATE users SET is_premium = TRUE WHERE id = $1`,
+                            [parseInt(userId)]
+                        );
+                    }
+                    break;
+
+                case 'subscription.pending':
+                    // Payment is pending (authorization issues)
+                    await pool.query(
+                        `UPDATE subscriptions 
+                         SET status = 'pending', updated_at = CURRENT_TIMESTAMP
+                         WHERE razorpay_subscription_id = $1`,
+                        [subscriptionId]
+                    );
+                    break;
+
+                case 'subscription.halted':
+                    // Payment failed multiple times, subscription halted
+                    await pool.query(
+                        `UPDATE subscriptions 
+                         SET status = 'halted', updated_at = CURRENT_TIMESTAMP
+                         WHERE razorpay_subscription_id = $1`,
+                        [subscriptionId]
+                    );
+
+                    if (userId) {
+                        await pool.query(
+                            `UPDATE users SET is_premium = FALSE WHERE id = $1`,
+                            [parseInt(userId)]
+                        );
+                    }
+                    break;
+
+                case 'subscription.cancelled':
+                    // Subscription cancelled (either by user request or payment failure)
+                    await pool.query(
+                        `UPDATE subscriptions 
+                         SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+                         WHERE razorpay_subscription_id = $1`,
+                        [subscriptionId]
+                    );
+
+                    // Only remove premium if current period has ended
+                    if (userId && payload.ended_at) {
+                        await pool.query(
+                            `UPDATE users SET is_premium = FALSE WHERE id = $1`,
+                            [parseInt(userId)]
+                        );
+                    }
+                    break;
+
+                case 'subscription.completed':
+                    // All billing cycles completed
+                    await pool.query(
+                        `UPDATE subscriptions 
+                         SET status = 'completed', updated_at = CURRENT_TIMESTAMP
+                         WHERE razorpay_subscription_id = $1`,
+                        [subscriptionId]
+                    );
+
+                    if (userId) {
+                        await pool.query(
+                            `UPDATE users SET is_premium = FALSE WHERE id = $1`,
+                            [parseInt(userId)]
+                        );
+                    }
+                    break;
+
+                case 'subscription.paused':
+                    // Subscription paused
+                    await pool.query(
+                        `UPDATE subscriptions 
+                         SET status = 'paused', updated_at = CURRENT_TIMESTAMP
+                         WHERE razorpay_subscription_id = $1`,
+                        [subscriptionId]
+                    );
+                    break;
+
+                case 'subscription.resumed':
+                    // Subscription resumed from pause
+                    await pool.query(
+                        `UPDATE subscriptions 
+                         SET status = 'active', updated_at = CURRENT_TIMESTAMP
+                         WHERE razorpay_subscription_id = $1`,
+                        [subscriptionId]
+                    );
+
+                    if (userId) {
+                        await pool.query(
+                            `UPDATE users SET is_premium = TRUE WHERE id = $1`,
+                            [parseInt(userId)]
+                        );
+                    }
+                    break;
+
+                default:
+                    console.log(`[WEBHOOK] Unhandled subscription event: ${event}`);
+            }
         }
 
-        console.log(`[WEBHOOK] Event: ${event}, Subscription: ${payload.id}`);
-
-        const subscriptionId = payload.id;
-        const userId = payload.notes?.user_id;
-
-        switch (event) {
-            case 'subscription.activated':
-            case 'subscription.charged':
-                // Subscription is now active
-                await pool.query(
-                    `UPDATE subscriptions 
-                     SET status = 'active', 
-                         current_period_start = to_timestamp($1),
-                         current_period_end = to_timestamp($2),
-                         updated_at = CURRENT_TIMESTAMP
-                     WHERE razorpay_subscription_id = $3`,
-                    [payload.current_start, payload.current_end, subscriptionId]
-                );
-
-                if (userId) {
-                    await pool.query(
-                        `UPDATE users SET is_premium = TRUE WHERE id = $1`,
-                        [parseInt(userId)]
-                    );
-                }
-                break;
-
-            case 'subscription.cancelled':
-            case 'subscription.completed':
-                // Subscription ended
-                await pool.query(
-                    `UPDATE subscriptions 
-                     SET status = $1, updated_at = CURRENT_TIMESTAMP
-                     WHERE razorpay_subscription_id = $2`,
-                    [event === 'subscription.cancelled' ? 'cancelled' : 'expired', subscriptionId]
-                );
-
-                if (userId) {
-                    await pool.query(
-                        `UPDATE users SET is_premium = FALSE WHERE id = $1`,
-                        [parseInt(userId)]
-                    );
-                }
-                break;
-
-            default:
-                console.log(`[WEBHOOK] Unhandled event: ${event}`);
+        // Handle payment failure events
+        if (paymentPayload && event === 'payment.failed') {
+            console.log(`[WEBHOOK] Payment failed for: ${paymentPayload.id}`);
+            // You could send notification to user here
         }
 
+        // Always return 200 to acknowledge receipt
         res.status(200).json({ received: true });
 
     } catch (err) {
         console.error("WEBHOOK ERROR:", err);
+        // Return 200 even on error to prevent Razorpay from retrying
         res.status(200).json({ received: true, error: err.message });
     }
 };

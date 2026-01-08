@@ -8,7 +8,6 @@ import {
 import { authMiddleware } from "../../middleware/authMiddleware.js";
 
 const router = express.Router();
-
 /**
  * Protected Routes (require JWT)
  */

@@ -420,7 +420,6 @@ export const addExpense = async (req, res) => {
 };
 
 // controllers/groupController.js
-
 export const getGroupsSummary = async (req, res) => {
     try {
         const userId = req.userId;
